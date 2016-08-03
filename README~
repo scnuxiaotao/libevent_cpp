@@ -1,0 +1,24 @@
+	
+	struct event_base* base = event_base_new();
+	1.为base分配空间
+	2.初始化事件链表
+	3.初始化io事情驱动
+	4.返回base
+	
+	event_set(&signal_int, SIGINT, EV_SIGNAL|EV_PERSIST, signal_cb,
+	    &signal_int);
+	1.初始化event的成员
+	
+	event_base_set(base, &signal_int);
+	1.修改event的ev_base成员
+
+	event_add(&signal_int, NULL);
+	1.将事件加入相应的链表中
+
+	event_base_dispatch(base);
+	1.调用系统I/O demultiplexer等待就绪I/O events
+	2.将事件加入活跃的链表
+	3.处理链表中的所有就绪事件
+	
+	
+	

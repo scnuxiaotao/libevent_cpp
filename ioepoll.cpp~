@@ -1,0 +1,228 @@
+/*
+ * ioepoll.cpp
+ *
+ *  Created on: 2016年6月11日
+ *      Author: xiaotao
+ */
+
+#include "ioepoll.h"
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include "errno.h"
+#include "event.h"
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include "eventbase.h"
+#include "esignal.h"
+
+#define FD_CLOSEONEXEC(x) do { \
+        if (fcntl(x, F_SETFD, 1)) ; \
+} while (0)
+
+io_epoll::io_epoll(event_base *base) :
+		epollop_(NULL) {
+	int epfd;
+
+	ev_base = base;
+
+	//新建一个文件描述符来标志事件表
+	if ((epfd = epoll_create(32000)) == -1)
+		return;
+
+	//文件描述符fork子进程后执行exec时就关闭
+	FD_CLOSEONEXEC(epfd);
+
+	//新建一个管理事件的结构
+	epollop_ = new epollop();
+	if (epollop_ == NULL)
+		return;
+
+	epollop_->epfd = epfd;
+
+	//关注事件最多是INITIAL_NEVENTS
+	epollop_->events = new epoll_event[INITIAL_NEVENTS];
+
+	if (epollop_->events == NULL) {
+		delete epollop_;
+		return;
+	}
+
+	epollop_->nevents = INITIAL_NEVENTS;
+
+	//关注的文件描述符最多是INITIAL_NFILES
+	epollop_->fds = new evepoll[INITIAL_NFILES];
+
+
+
+	if (epollop_->fds == NULL) {
+		delete[] epollop_->events;
+		delete epollop_;
+		return;
+	}
+
+	epollop_->nfds = INITIAL_NFILES;
+
+}
+
+io_epoll::~io_epoll() {
+
+	if (epollop_->fds)
+		delete[] epollop_->fds;
+
+	if (epollop_->events)
+		delete[] epollop_->events;
+
+	if (epollop_->epfd >= 0)
+		close(epollop_->epfd);
+
+	delete epollop_;
+}
+
+int io_epoll::epoll_add(event *ev) {
+	epoll_event epev = { 0, { 0 } };
+	evepoll *evep;
+	int fd, op, events;
+
+	if (ev->ev_events & EV_SIGNAL)
+		return (ev_base->sig->evsignal_add(ev));
+
+	fd = ev->ev_fd;
+
+	evep = &epollop_->fds[fd];
+
+	op = EPOLL_CTL_ADD;
+	events = 0;
+
+	//修改还是增加？
+	if (evep->evread != NULL) {
+		events |= EPOLLIN;
+		op = EPOLL_CTL_MOD;
+	}
+	if (evep->evwrite != NULL) {
+		events |= EPOLLOUT;
+		op = EPOLL_CTL_MOD;
+	}
+
+	if (ev->ev_events & EV_READ)
+		events |= EPOLLIN;
+	if (ev->ev_events & EV_WRITE)
+		events |= EPOLLOUT;
+
+	epev.data.fd = fd;
+	epev.events = events;
+
+	if (epoll_ctl(epollop_->epfd, op, ev->ev_fd, &epev) == -1)
+		return -1;
+
+	if (ev->ev_events & EV_READ)
+		evep->evread = ev;
+	if (ev->ev_events & EV_WRITE)
+		evep->evwrite = ev;
+
+	return 0;
+
+}
+int io_epoll::epoll_del(event *ev) {
+	epoll_event epev = { 0, { 0 } };
+	evepoll *evep;
+	int fd, events, op;
+	int needwritedelete = 1, needreaddelete = 1;
+
+	if (ev->ev_events & EV_SIGNAL)
+			return (ev_base->sig->evsignal_del(ev));
+
+	fd = ev->ev_fd;
+	if (fd >= epollop_->nfds)
+		return 0;
+	evep = &epollop_->fds[fd];
+	op = EPOLL_CTL_DEL;
+	events = 0;
+
+	if (ev->ev_events & EV_READ)
+		events |= EPOLLIN;
+	if (ev->ev_events & EV_WRITE)
+		events |= EPOLLOUT;
+
+	if ((events & (EPOLLIN | EPOLLOUT)) != (EPOLLIN | EPOLLOUT)) {
+		if ((events & EPOLLIN) && evep->evwrite != NULL) {
+			needwritedelete = 0;
+			events = EPOLLOUT;
+			op = EPOLL_CTL_MOD;
+		} else if ((events & EPOLLOUT) && evep->evread != NULL) {
+			needreaddelete = 0;
+			events = EPOLLIN;
+			op = EPOLL_CTL_MOD;
+		}
+	}
+
+	epev.events = events;
+	epev.data.fd = fd;
+
+	if (needreaddelete)
+		evep->evread = NULL;
+	if (needwritedelete)
+		evep->evwrite = NULL;
+
+	if (epoll_ctl(epollop_->epfd, op, fd, &epev) == -1)
+		return -1;
+
+	return 0;
+}
+int io_epoll::epoll_dispatch(timeval *tv) {
+	epoll_event *events = epollop_->events;
+	evepoll *evep;
+	int i, res, timeout = -1;
+	if (tv != NULL)
+			timeout = tv->tv_sec * 1000 + (tv->tv_usec + 999) / 1000;
+
+		if (timeout > MAX_EPOLL_TIMEOUT_MSEC) {
+			timeout = MAX_EPOLL_TIMEOUT_MSEC;
+		}
+	res = epoll_wait(epollop_->epfd, events, epollop_->nevents, timeout);
+
+	if (res == -1) {
+		if (errno != EINTR) {
+			return -1;
+		}
+		ev_base->sig->evsignal_process();
+		return 0;
+	} else if (ev_base->sig->evsignal_caught) {
+		ev_base->sig->evsignal_process();
+	}
+
+	for (i = 0; i < res; i++) {
+		int what = events[i].events;
+		event *evread = NULL, *evwrite = NULL;
+		int fd = events[i].data.fd;
+
+		if (fd < 0 || fd >= epollop_->nfds)
+			continue;
+		evep = &epollop_->fds[fd];
+
+		if (what & (EPOLLHUP | EPOLLERR)) {
+			evread = evep->evread;
+			evwrite = evep->evwrite;
+		} else {
+			if (what & EPOLLIN) {
+				evread = evep->evread;
+			}
+
+			if (what & EPOLLOUT) {
+				evwrite = evep->evwrite;
+			}
+		}
+
+		if (!(evread || evwrite))
+			continue;
+
+		if (evread != NULL)
+			ev_base->event_active(evread, EV_READ, 1);
+		if (evwrite != NULL)
+			ev_base->event_active(evwrite, EV_WRITE, 1);
+
+	}
+
+	return 0;
+}
+
